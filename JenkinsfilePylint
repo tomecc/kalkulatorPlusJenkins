@@ -1,0 +1,179 @@
+/**
+Jenkins declarative pipeline file.
+
+WARNING:
+Please don't modify this file unless you know what you are doing.
+Modifications may break the test process on Jenkins
+
+v1.0.0 - 2021-04-23/tomecc/tomec2@interia.pl
+
+**/
+
+def gerrit_triggers = [patchsetCreated(excludeDrafts: true,
+                                       excludeNoCodeChange: false,
+                                       excludeTrivialRebase: false),
+                       draftPublished(),]
+if ( params.MASTER_RUN == "True" )
+{
+    gerrit_triggers = [changeMerged(),]
+}
+
+pipeline {
+    agent any
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: "100", daysToKeepStr: "60"))
+    }
+    environment {
+        USER = "ca_WBIT_CICD"
+        GIT_DISCOVERY_ACROSS_FILESYSTEM = 1
+        GIT_URL = "ssh://${USER}@${GERRIT_HOST}:${GERRIT_PORT}/${GERRIT_PROJECT}"
+    }
+    parameters {
+        string(name: "MASTER_RUN", defaultValue: params.MASTER_RUN ?: "",
+               description: "Set as 'False' to run Pylint only for the changes triggered by patch-set created, " +
+                            "value 'True' runs Pylint for all files after the change merge.")
+        string(name: "DOCKER_IMAGE", defaultValue: "common_lib_ubuntu_18_04",
+               description: "Docker image to be run. Will be overwritten by declarative pipeline file.")
+    }
+    triggers {
+        gerrit(
+            serverName: "Gerrit Nokia Server",
+            gerritProjects: [[ compareType: "PLAIN",
+                               pattern: "${GERRIT_PROJECT}",
+                               branches: [[ compareType: "REG_EXP",
+                                            pattern: ".*" ]],
+                               disableStrictForbiddenFileVerification: false
+                            ]],
+            triggerOnEvents: gerrit_triggers,
+            skipVote: [ onSuccessful: true,
+                        onFailed    : true,
+                        onUnstable  : true,
+                        onNotBuilt  : true,
+                        // onAborted doesn't seem to have any effect at all; TODO: Jenkins needs to be updated
+                        onAborted   : true
+            ],
+            buildSuccessfulMessage: "SUCCESS (Pylint)",
+            buildFailureMessage: "FAILURE (Pylint)",
+            buildUnstableMessage: "UNSTABLE (Pylint)",
+            buildNotBuiltMessage: "NOT BUILT (Pylint)"
+        )
+    }
+    stages {
+        stage('Set environment') {
+            steps {
+                script {
+                    env.MASTER_RUN = params.MASTER_RUN
+                    env.DOCKER_IMAGE = params.DOCKER_IMAGE
+                    env.PYLINT_LABEL_VAL = 0
+                    env.PYLINT_RES = "Empty"
+                }
+            }
+        }
+        stage('Repo sync') {
+            steps {
+                script {
+                    try {
+                        println "GERRIT_REFSPEC: ${GERRIT_REFSPEC}"
+                        println "GERRIT_PATCHSET_REVISION: ${GERRIT_PATCHSET_REVISION}"
+                        checkout([$class: "GitSCM",
+                                  branches: [[name: "${GERRIT_PATCHSET_REVISION}"]],
+                                  userRemoteConfigs: [[ name: "",
+                                                        refspec: "${GERRIT_REFSPEC}",
+                                                        url: "${GIT_URL}"]]])
+                    } catch (err) {
+                        error "Git checkout: ${err}"
+                        currentBuild.result = "FAILURE"
+                    }
+                    env.GIT_REV = sh(script: 'git log -n1 --pretty=format:"%h"', returnStdout: true).trim()
+                    currentBuild.displayName = "#${BUILD_NUMBER} rev:${GIT_REV}"
+                }
+            }
+        }
+        stage('Run PyLint') {
+            steps {
+                script {
+                    if ("${MASTER_RUN}" == "True") {
+                        env.MASTER_RUN_SELECTION = '-m'
+                    } else {
+                        env.MASTER_RUN_SELECTION = ''
+                    }
+                    sh '''
+                    {
+                        echo "python3 --version"
+                        echo "pylint --version"
+                        echo "python3 ci/jenkins_test_pylint.py -v ${MASTER_RUN_SELECTION} | tee pylint.log"
+                    } > docker_script.sh
+
+                    docker run --rm -v ${WORKSPACE}:/workdir:Z ${DOCKER_IMAGE} \
+                               --workdir=/workdir --username=${USER} \
+                               --id=\"\$(id -u $USER):\$(id -g ${USER})\" \
+                               --ssh_key=\"\$(cat ~/.ssh/id_rsa)\" \
+                               --gitconfig=\"\$(cat ~/.gitconfig)\" \
+                               --cmd='sh docker_script.sh'
+                    '''
+                }
+            }
+        }
+        stage('Check result') {
+            steps {
+                script {
+                    try {
+                        env.PYLINT_OUT = sh(script: 'grep "Your code" pylint.log',
+                                            returnStdout: true).trim()
+                        currentBuild.description = "PYLINT: ${PYLINT_OUT}<br>" +
+                                                   "<a href='${JENKINS_URL}/job/${JOB_BASE_NAME}/"
+                        env.PYLINT_RES = sh(script: 'echo ${PYLINT_OUT##* } | cut -d"/" -f1',
+                                            returnStdout: true).trim()
+                    } catch (Exception e) {
+                        echo "Something went wrong, there is no Pylint result available!\nException message: $e"
+                    }
+
+                    if ("${PYLINT_RES}" == "Empty") {
+                        // Ideally, currentBuild.result would be set to 'ABORTED', however using 'ABORTED' causes
+                        // pipeline to send -1 Verified (skipVote: onAborted doesn't seem to function)
+                        // TODO: Update Jenkins (and docker image and plugins etc.)
+                        currentBuild.result = 'FAILURE'
+                        env.PYLINT_LABEL_VAL = "0"
+                    } else if (Double.parseDouble("${PYLINT_RES}") >= 10) {
+                        currentBuild.result = 'SUCCESS'
+                        env.PYLINT_LABEL_VAL = "+1"
+                    }
+                    else {
+                        currentBuild.result = 'FAILURE'
+                        env.PYLINT_LABEL_VAL = "-1"
+                    }
+                }
+            }
+        }
+    }
+    post {
+        always {
+            script {
+                if ("${PYLINT_RES}" == "Empty") {
+                    msg = "Pylint score is ${PYLINT_RES}. " +
+                          "Check build console output. Continue if you know what you are doing."
+                } else {
+                    msg = "Pylint score: ${PYLINT_RES}/10"
+                }
+
+                sh "python3 ci/post_message.py -m '${msg}'"
+                sh "cat message.json | ssh -p ${GERRIT_PORT} ${GERRIT_HOST} gerrit review ${GERRIT_PATCHSET_REVISION} --json"
+
+                try {
+                    sh "ssh -p ${GERRIT_PORT} ${GERRIT_HOST} gerrit review ${GERRIT_PATCHSET_REVISION} --label Pylint=${PYLINT_LABEL_VAL}"
+                } catch (err) {
+                    println "Couldn't send Pylint score to the gerrit repository."
+                }
+            }
+
+            archiveArtifacts artifacts: '*.log, cover/**',
+                             fingerprint: true, onlyIfSuccessful: false
+            recordIssues tools: [pyLint(pattern: 'pylint.log')],
+                         enabledForFailure: true,
+                         blameDisabled: true
+            deleteDir()
+        }
+    }
+}
